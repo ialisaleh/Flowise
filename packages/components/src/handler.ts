@@ -5,6 +5,12 @@ import CallbackHandler from 'langfuse-langchain'
 import lunary from 'lunary'
 import { RunTree, RunTreeConfig, Client as LangsmithClient } from 'langsmith'
 import { Langfuse, LangfuseTraceClient, LangfuseSpanClient, LangfuseGenerationClient } from 'langfuse'
+import opentelemetry, { Span } from '@opentelemetry/api'
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
+import { Resource } from '@opentelemetry/resources'
+import { SimpleSpanProcessor, Tracer } from '@opentelemetry/sdk-trace-base'
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node'
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
 
 import { BaseCallbackHandler, NewTokenIndices, HandleLLMNewTokenCallbackFields } from '@langchain/core/callbacks/base'
 import { LangChainTracer, LangChainTracerFields } from '@langchain/core/tracers/tracer_langchain'
@@ -22,6 +28,52 @@ import { AIMessageChunk } from '@langchain/core/messages'
 
 interface AgentRun extends Run {
     actions: AgentAction[]
+}
+
+interface PhoenixTracerOptions {
+    apiKey: string
+    baseUrl: string
+    projectName: string
+    sdkIntegration?: string
+    sessionId?: string
+}
+
+function getPhoenixTracer(options: PhoenixTracerOptions): Tracer | undefined {
+    const SEMRESATTRS_PROJECT_NAME = 'openinference.project.name'
+    try {
+        const traceExporter = new OTLPTraceExporter({
+            url: `${options.baseUrl}/v1/traces`,
+            headers: {
+                api_key: options.apiKey
+            }
+        })
+        const tracerProvider = new NodeTracerProvider({
+            resource: new Resource({
+                [ATTR_SERVICE_NAME]: options.projectName,
+                [ATTR_SERVICE_VERSION]: '1.0.0',
+                [SEMRESATTRS_PROJECT_NAME]: options.projectName
+            })
+        })
+        tracerProvider.addSpanProcessor(new SimpleSpanProcessor(traceExporter))
+        return tracerProvider.getTracer('phoenix-tracer')
+    } catch (err) {
+        if (process.env.DEBUG === 'true') console.error(`Error setting up Phoenix tracer: ${err.message}`)
+        return undefined
+    }
+}
+
+function mainWork(tracer: Tracer) {
+    const parentSpan = tracer.startSpan('mainWork')
+    for (let i = 0; i < 5; i += 1) {
+        doWork(tracer, parentSpan, i)
+    }
+    parentSpan.end()
+}
+
+function doWork(tracer: Tracer, parent: Span, i: number) {
+    const ctx = opentelemetry.trace.setSpan(opentelemetry.context.active(), parent)
+    const span = tracer.startSpan(`doWork:${i}`, undefined, ctx)
+    span.end()
 }
 
 function tryGetJsonSpaces() {
@@ -420,6 +472,28 @@ export const additionalCallbacks = async (nodeData: INodeData, options: ICommonO
 
                     const trace = langwatch.getTrace()
                     callbacks.push(trace.getLangChainCallback())
+                } else if (provider === 'phoenix') {
+                    const phoenixApiKey = getCredentialParam('phoenixApiKey', credentialData, nodeData)
+                    const phoenixEndpoint = getCredentialParam('phoenixEndpoint', credentialData, nodeData)
+                    const phoenixProject = analytic[provider].projectName as string
+
+                    let phoenixOptions: PhoenixTracerOptions = {
+                        apiKey: phoenixApiKey,
+                        baseUrl: phoenixEndpoint ?? 'https://app.phoenix.arize.com',
+                        projectName: phoenixProject ?? 'default',
+                        sdkIntegration: 'Flowise'
+                    }
+
+                    if (options.chatId) phoenixOptions.sessionId = options.chatId
+                    if (nodeData?.inputs?.analytics?.phoenix) {
+                        phoenixOptions = { ...phoenixOptions, ...nodeData?.inputs?.analytics?.phoenix }
+                    }
+
+                    const tracer = getPhoenixTracer(phoenixOptions)
+                    callbacks.push(tracer)
+
+                    // Test Phoenix Tracing
+                    if (tracer) mainWork(tracer)
                 }
             }
         }
@@ -498,6 +572,20 @@ export class AnalyticHandler {
                         })
 
                         this.handlers['langWatch'] = { client: langwatch }
+                    } else if (provider === 'phoenix') {
+                        const phoenixApiKey = getCredentialParam('phoenixApiKey', credentialData, this.nodeData)
+                        const phoenixEndpoint = getCredentialParam('phoenixEndpoint', credentialData, this.nodeData)
+                        const phoenixProject = analytic[provider].projectName as string
+
+                        let phoenixOptions: PhoenixTracerOptions = {
+                            apiKey: phoenixApiKey,
+                            baseUrl: phoenixEndpoint ?? 'https://app.phoenix.arize.com',
+                            projectName: phoenixProject ?? 'default',
+                            sdkIntegration: 'Flowise'
+                        }
+
+                        const phoenix = getPhoenixTracer(phoenixOptions)
+                        this.handlers['phoenix'] = { client: phoenix, phoenixProject }
                     }
                 }
             }
